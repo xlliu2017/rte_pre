@@ -9,7 +9,7 @@ import time
 import random
 import time
 from utils import greenprint
-from RTE_Adaptive_TFPS_func import VDXY, FSM, Inflow2alpha, MLRO_Dirichlet, MBTO_Dirichlet
+from mgRTE.RTE_ATFPS_func import VDXY, FSM, Inflow2alpha, MLRO_Dirichlet, MBTO_Dirichlet
 
 # 2d dense matrix
 def read_bm_data(fn):

@@ -15,7 +15,7 @@ import numpy as np
 from RTE_mgmodel import MG_precond
 from RTE_dataloader import UnsuperviseDataset
 from utils import Timer, save_loss_history, save_model, greenprint, check_cuda_mem
-from RTE_Adaptive_TFPS_func import func_inflow_Dirichlet, restrict_basis, squeeze_basis
+from mgRTE.RTE_ATFPS_func import func_inflow_Dirichlet, restrict_basis, squeeze_basis
 from gmres import mygmres2dtorch
 from RTE_datagenerator import RTECoef
 
