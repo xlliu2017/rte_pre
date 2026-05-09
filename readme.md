@@ -28,7 +28,7 @@ The main goal is to compare the performance of the following preconditioners for
 
 ---
 
-## Data Structure
+## File Folder Description
 
 ### `discretized_parameters`
 
