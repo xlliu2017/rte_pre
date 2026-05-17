@@ -8,6 +8,109 @@ import numpy as np
 import torch
 
 
+def _fgmres_cycle(A, b, M, x0, b_norm, tol, maxiter, verbose, log_step, iter_offset):
+    device = b.device
+    dtype = b.dtype
+    breakdown_tol = 1e-14
+
+    r0 = b - A(x0)
+    beta = torch.norm(r0)
+    rel0 = (beta / b_norm).item()
+    history = [rel0]
+    if rel0 < tol:
+        return x0, history, 0, True, False
+
+    V = [r0 / beta]
+    Z = []
+    H = torch.zeros((maxiter + 1, maxiter), dtype=dtype, device=device)
+    x = x0
+    converged = False
+    breakdown = False
+
+    for j in range(maxiter):
+        z_j = M(V[j])
+        Z.append(z_j)
+        w = A(z_j)
+        for i in range(j + 1):
+            H[i, j] = torch.sum(w * V[i].conj())
+            w = w - H[i, j] * V[i]
+
+        H[j + 1, j] = torch.norm(w)
+        h_next = torch.abs(H[j + 1, j]).item()
+        if h_next > breakdown_tol:
+            V.append(w / H[j + 1, j])
+        else:
+            breakdown = True
+
+        H_j = H[:j + 2, :j + 1]
+        e1 = torch.zeros(j + 2, dtype=dtype, device=device)
+        e1[0] = beta
+        y = torch.linalg.lstsq(H_j, e1).solution
+
+        Z_tensor = torch.stack(Z, dim=0)
+        y_shape = [j + 1] + [1] * (Z_tensor.ndim - 1)
+        x = x0 + torch.sum(Z_tensor * y[:j + 1].reshape(y_shape), dim=0)
+
+        relres = (torch.norm(b - A(x)) / b_norm).item()
+        history.append(relres)
+        global_iter = iter_offset + j + 1
+        if verbose and ((global_iter % log_step == 0) or relres < tol):
+            print(f"FGMRES iter {global_iter:4d}, relres = {relres:.2e}")
+        if relres < tol:
+            converged = True
+            break
+        if breakdown:
+            break
+
+    return x, history, len(history) - 1, converged, breakdown
+
+
+def fgmres(A, b, M, x0=None, tol=1e-6, maxiter=100, restart=None, max_restarts=None, verbose=True, log_step=10):
+    """
+    Flexible right-preconditioned GMRES using true residual stopping.
+
+    This mirrors the NPBS/Helmholtz workflow: store z_j = M(v_j), then
+    reconstruct x_j from the preconditioned Arnoldi basis. It is safer for
+    learned RTE preconditioners because M may be nonlinear or stateful.
+    """
+    if x0 is None:
+        x0 = torch.zeros_like(b)
+    if maxiter < 1:
+        raise ValueError("maxiter must be >= 1")
+    if restart is not None:
+        restart = min(int(restart), maxiter)
+        if restart < 1:
+            raise ValueError("restart must be >= 1")
+    if max_restarts is not None and int(max_restarts) < 0:
+        raise ValueError("max_restarts must be >= 0")
+
+    b_norm = torch.clamp(torch.norm(b), min=1e-30)
+    log_step = max(int(log_step), 1)
+    if restart is None:
+        x, history, _, _, _ = _fgmres_cycle(A, b, M, x0, b_norm, tol, maxiter, verbose, log_step, 0)
+        return x, history
+
+    x = x0
+    history = []
+    total_iters = 0
+    restarts_used = 0
+    while total_iters < maxiter:
+        inner_maxiter = min(restart, maxiter - total_iters)
+        x, cycle_history, cycle_iters, converged, breakdown = _fgmres_cycle(
+            A, b, M, x, b_norm, tol, inner_maxiter, verbose, log_step, total_iters
+        )
+        history.extend(cycle_history if not history else cycle_history[1:])
+        total_iters += cycle_iters
+        if converged or breakdown or cycle_iters == 0:
+            break
+        if max_restarts is not None and restarts_used >= int(max_restarts):
+            break
+        restarts_used += 1
+        if verbose:
+            print(f"FGMRES restart {restarts_used} after {total_iters} iterations, relres = {history[-1]:.2e}")
+    return x, history
+
+
 class mygmres():
     def __init__(self):
         pass

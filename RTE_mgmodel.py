@@ -225,13 +225,17 @@ class MG_precond(nn.Module):
                 M,
                 u_channels_list=[2, 20, 30, 40, 50],
                 a_channels_list=[32, 32, 32, 32, 32],
-                mg_levels=[1, 2, 4, 8, 8]):
+                mg_levels=[1, 2, 4, 8, 8],
+                input_channels=None,
+                output_channels=None):
         super().__init__()
         torch.set_default_dtype(torch.float32)
         self.mg_levels = mg_levels
-        self.lifting_rhs = nn.Conv2d(8*M, u_channels_list[0], kernel_size=1, stride=1, padding=0, bias=False)
+        self.input_channels = 8 * M if input_channels is None else int(input_channels)
+        self.output_channels = self.input_channels if output_channels is None else int(output_channels)
+        self.lifting_rhs = nn.Conv2d(self.input_channels, u_channels_list[0], kernel_size=1, stride=1, padding=0, bias=False)
         self.mg = mg_operator(u_channels_list=u_channels_list, a_channels_list=a_channels_list, num_iteration=mg_levels)
-        self.proj_u = nn.Conv2d(u_channels_list[0], 8*M, kernel_size=1, stride=1, padding=0, bias=False)
+        self.proj_u = nn.Conv2d(u_channels_list[0], self.output_channels, kernel_size=1, stride=1, padding=0, bias=False)
 
     def setup(self, coeff):
         '''
@@ -245,4 +249,3 @@ class MG_precond(nn.Module):
         u = self.mg(rhs, a_list, inv_a_list)
         u = self.proj_u(u)
         return u 
-

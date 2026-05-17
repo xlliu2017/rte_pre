@@ -151,25 +151,73 @@ Contains additional plotting code for producing cleaner and more visually appeal
 
 ## Usage
 
-### 1. Train MgNet
+### 1. Install
 
-Run `train.py` for each physical regime (for example: `transport`, `diffusion`, `interface`, `bufferzone`, etc.).
-
-Recommended settings:
-
-- `num_coef = 1000`, `num_data = 10000`
-- `num_coef = 2000`, `num_data = 20000`
-
-That is, for each regime, you may train two MgNet models:
-
-- one with **10,000 samples**,
-- one with **20,000 samples**.
-
----
-
-### 2. Generate data if needed
-
-If the required `RTEData` in `train.py` does not exist, use:
+Use either the Python project metadata:
 
 ```bash
-python RTE_datagenerator.py
+python -m pip install -e ".[dev]"
+```
+
+or the Conda environment:
+
+```bash
+conda env create -f environment.yml
+conda activate mgRTE
+python -m pip install -e ".[dev]"
+```
+
+### 2. Generate Data
+
+Generated `.pt` datasets are intentionally ignored by git. Generate the dataset that matches the training config:
+
+```bash
+python RTE_datagenerator.py --config configs/default.yaml
+```
+
+You can override individual fields:
+
+```bash
+python RTE_datagenerator.py --data_type diffusion --num_coef 1000 --mesh_size 16 --N 1 --tol_exp 5 --kernel_g 0
+```
+
+### 3. Train MgNet
+
+```bash
+python train.py --config configs/default.yaml
+```
+
+The default config preserves the original raw-residual objective. The NPBS-style
+RTE objective trains in the block-Jacobi/Born coordinate `funcDinv(rhs)`:
+
+```bash
+python train.py --config configs/born_precond.yaml
+```
+
+Training saves model weights and train/validation losses under `model_precond/`, `train_loss/`, and `val_loss/`.
+
+### 4. Evaluate Preconditioners
+
+```bash
+python inference.py --config configs/default.yaml --checkpoint model_precond/CosineAnnealingLR_T_max100/lr0.001/<checkpoint>.pt
+```
+
+To compare the original raw MgNet preconditioner with the Born-coordinate variant:
+
+```bash
+python inference.py --config configs/born_precond.yaml --checkpoint model_precond/CosineAnnealingLR_T_max100/lr0.001/<checkpoint>.pt --preconditioners block_jacobi mgnet_raw mgnet_born
+```
+
+The inference script compares right preconditioners with FGMRES and writes a JSON summary under `outputs/`. It reports both true relative residual and the final `funcDinv`-metric residual.
+
+### Experimental Pseudo-Spectral Operator
+
+`RTE_pseudospectral.py` adds a separate periodic DOM pseudo-spectral backend with state shape `[batch, 4*M, I, J]`. It is intended for smooth/reference experiments and FFT Green preconditioning, not as a replacement for ATFPS on interface or diffusion-limit cases.
+
+### 5. Test
+
+```bash
+python -m pytest
+```
+
+The current tests cover importability, deterministic RHS sampling, MgNet forward shape, variable channel MgNet shape, ATFPS masks, the `all` regime epsilon branch, the independent y-direction eigenbasis, FGMRES, raw-vs-Born preconditioning comparison, and pseudo-spectral reference identities.

@@ -1,6 +1,24 @@
 import torch
 import numpy as np
 
+def _sorted_real_eig(block, tol=1e-8):
+    vals, vecs = torch.linalg.eig(block.to(torch.float64))
+    max_imag = torch.max(torch.abs(torch.imag(vals))).item()
+    if max_imag > tol:
+        raise ValueError(f'Complex eigenvalues above tolerance: {max_imag:.3e}')
+    vals = torch.real(vals)
+    vecs = torch.real(vecs)
+    order = torch.argsort(vals, dim=-1)
+    vals = torch.gather(vals, -1, order)
+    vecs = torch.gather(vecs, -1, order.unsqueeze(-2).expand(*vecs.shape[:-1], order.shape[-1]))
+    max_vals = torch.clamp(torch.max(torch.abs(vecs), dim=-2, keepdim=True)[0], min=1e-30)
+    vecs = vecs / max_vals
+    first_nonzero = torch.argmax((torch.abs(vecs) > tol).int(), dim=-2).unsqueeze(-2)
+    signs = torch.gather(torch.sign(vecs), -2, first_nonzero)
+    signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+    return vals, vecs / signs
+
+
 def VDXY(Sigma_T, Sigma_a, Varepsilon, ct, st, omega, Kappa, M, device='cpu'):
     """
     参数:
@@ -20,36 +38,21 @@ def VDXY(Sigma_T, Sigma_a, Varepsilon, ct, st, omega, Kappa, M, device='cpu'):
     KW = Kappa @ torch.diag(omega)  # [4M,4M]
     eye = torch.eye(4*M, device=device)
     inv_ct = torch.diag(1/ct.squeeze(-1))  # [4M,4M]
+    inv_st = torch.diag(1/st.squeeze(-1))  # [4M,4M]
     
     # 向量化计算 blockx [I0,J0,4M,4M]
-    blockx = inv_ct @ (ratio.unsqueeze(-1).unsqueeze(-1) * KW - eye)
+    base = ratio.unsqueeze(-1).unsqueeze(-1) * KW - eye
+    blockx = inv_ct @ base
+    blocky = inv_st @ base
     
     # 批量特征分解 (需转为float64)
-    va, ve = torch.linalg.eig(blockx.to(torch.float64))
-    if torch.any(torch.abs(torch.imag(va)) > 0):
-        raise ValueError('Complex eigenvalues!')
-    va = torch.real(va)  # [I0,J0,4M]
-    ve = torch.real(ve)  # [I0,J0,4M,4M]
+    vx_vals, vex = _sorted_real_eig(blockx)
+    vy_vals, vey = _sorted_real_eig(blocky)
     
-    # 排序特征值和特征向量
-    order = torch.argsort(va, dim=-1)  # [I0,J0,4M]
-    va = torch.gather(va, -1, order)  # [I0,J0,4M]
-    ve = torch.gather(ve, -1, order.unsqueeze(-2).expand(-1,-1,4*M,-1))  # [I0,J0,4M,4M]
-    
-    # 归一化特征向量
-    max_vals = torch.max(torch.abs(ve), dim=-2, keepdim=True)[0]  # [I0,J0,1,4M]
-    ve = ve / max_vals
-    first_nonzero = torch.argmax((torch.abs(ve) > 1e-8).int(), dim=-2).unsqueeze(-2)  # [I0,J0,4M,4M]
-    signs = torch.gather(torch.sign(ve), -2, first_nonzero)
-    vex = ve / signs
-    
-    # 处理排序索引
-    ct_idx = torch.argsort(ct)
-    st_idx = torch.argsort(st)
-    st_idx_inv = torch.argsort(st_idx)
-    vey = vex[:, :, ct_idx, :][:, :, st_idx_inv, :]
-    
-    VX, DX, VY, DY = vex.permute(2,3,0,1).to(torch.float32), va.permute(2,0,1).to(torch.float32), vey.permute(2,3,0,1).to(torch.float32), va.permute(2,0,1).to(torch.float32)
+    VX = vex.permute(2,3,0,1).to(torch.float32)
+    DX = vx_vals.permute(2,0,1).to(torch.float32)
+    VY = vey.permute(2,3,0,1).to(torch.float32)
+    DY = vy_vals.permute(2,0,1).to(torch.float32)
     return VX, DX, VY, DY
 
 
@@ -297,28 +300,42 @@ def MBTO_Dirichlet(VY, DY, Sigma_T, Varepsilon, hy, tol, M, I0, J0, device='cpu'
     
     return Mb.permute(2,3,0,1), Mt.permute(2,3,0,1), VecSizeb, VecSizet
 
+def basis_mask(VecSize, M, device=None):
+    if device is None:
+        device = VecSize.device
+    return torch.cat([
+        torch.arange(2*M-1, -1, -1, device=device).reshape([1, 2*M, 1, 1]) < VecSize[:, 0, :, :].unsqueeze(1),
+        torch.arange(2*M, device=device).reshape([1, 2*M, 1, 1]) < VecSize[:, 1, :, :].unsqueeze(1),
+        torch.arange(2*M-1, -1, -1, device=device).reshape([1, 2*M, 1, 1]) < VecSize[:, 2, :, :].unsqueeze(1),
+        torch.arange(2*M, device=device).reshape([1, 2*M, 1, 1]) < VecSize[:, 3, :, :].unsqueeze(1),
+    ], dim=1)
+
+
+def block_basis_mask(VecSize, M, device=None):
+    mask = basis_mask(VecSize, M, device).unsqueeze(2)
+    return mask.expand(-1, -1, 8*M, -1, -1)
+
+
 # Here VecSize includes VecSizel, VecSizer, VecSizeb, VecSizet, they belongs to 4 channels
-# get the selected and unselected basis function/velicity modes
+# get the selected and unselected basis function/velocity modes
 # for batch
 def restrict_basis(basis, VecSize, M, I0, J0, device='cpu'):
     # rhs.shape = [num_data, 8*M, I0, J0]
     # VecSize.shape = [num_data, 4, I0, J0]
-    mark = 0
+    squeeze_output = False
     if len(basis.shape) == 3:
         basis = basis.unsqueeze(0)
-        mark = 1
+        squeeze_output = True
     if len(VecSize.shape) == 3:
         VecSize = VecSize.unsqueeze(0)
-        mark = 1
-    basis_selected = torch.zeros([basis.shape[0], 8*M, I0, J0]).to(device)
-    basis_unselected = torch.zeros([basis.shape[0], 8*M, I0, J0]).to(device)
-    mask = torch.cat([torch.arange(2*M-1,-1,-1).reshape([1, 2*M, 1, 1]).to(device) < VecSize[:, 0, :, :].unsqueeze(1),
-                      torch.arange(2*M).reshape([1, 2*M, 1, 1]).to(device) < VecSize[:, 1, :, :].unsqueeze(1),
-                      torch.arange(2*M-1,-1,-1).reshape([1, 2*M, 1, 1]).to(device) < VecSize[:, 2, :, :].unsqueeze(1),
-                      torch.arange(2*M).reshape([1, 2*M, 1, 1]).to(device) < VecSize[:, 3, :, :].unsqueeze(1)], dim=1)
+    device = basis.device
+    VecSize = VecSize.to(device)
+    basis_selected = torch.zeros([basis.shape[0], 8*M, I0, J0], device=device, dtype=basis.dtype)
+    basis_unselected = torch.zeros([basis.shape[0], 8*M, I0, J0], device=device, dtype=basis.dtype)
+    mask = basis_mask(VecSize, M, device)
     basis_selected[mask] = basis[mask]
     basis_unselected[~mask] = basis[~mask]
-    if mark == 1:
+    if squeeze_output:
         basis_selected = basis_selected.squeeze(0)
         basis_unselected = basis_unselected.squeeze(0)
     return basis_selected, basis_unselected
@@ -326,23 +343,20 @@ def restrict_basis(basis, VecSize, M, I0, J0, device='cpu'):
 def squeeze_basis(basis, VecSize):
     # basis.shape = [num_data, 8*M, I0, J0]
     # VecSize.shape = [num_data, 4, I0, J0]
-    mark = 0
+    squeeze_output = False
     if len(basis.shape) == 3:
         basis = basis.unsqueeze(0)
-        mark = 1
+        squeeze_output = True
     if len(VecSize.shape) == 3:
         VecSize = VecSize.unsqueeze(0)
-        mark = 1
+    VecSize = VecSize.to(basis.device)
     num_data, M, I0, J0, device = basis.size(0), int(basis.size(1)/8), basis.size(2), basis.size(3), basis.device
-    mask = torch.cat([torch.arange(2*M-1,-1,-1).reshape([1, 2*M, 1, 1]).to(device) < VecSize[:, 0, :, :].unsqueeze(1),
-                      torch.arange(2*M).reshape([1, 2*M, 1, 1]).to(device) < VecSize[:, 1, :, :].unsqueeze(1),
-                      torch.arange(2*M-1,-1,-1).reshape([1, 2*M, 1, 1]).to(device) < VecSize[:, 2, :, :].unsqueeze(1),
-                      torch.arange(2*M).reshape([1, 2*M, 1, 1]).to(device) < VecSize[:, 3, :, :].unsqueeze(1)], dim=1)
+    mask = basis_mask(VecSize, M, device)
 
     basis_selected = basis[mask]
     basis_unselected = basis[~mask]
     
-    if mark == 1:
+    if squeeze_output:
         basis_selected = basis_selected.squeeze(0)
         basis_unselected = basis_unselected.squeeze(0)
     return basis_selected, basis_unselected
@@ -510,6 +524,7 @@ def funcD(inflow, I2A, fsmLRBTC, MLRBT, VecSize, M, I0, J0, device='cpu'):
     if len(I2A.shape) == 4 and len(fsmLRBTC.shape)==5 and len(MLRBT.shape)==5 and len(VecSize.shape)==3:
         I2A, fsmLRBTC, MLRBT, VecSize = I2A.unsqueeze(0), fsmLRBTC.unsqueeze(0), MLRBT.unsqueeze(0), VecSize.unsqueeze(0)
         mark = 1
+    device = inflow.device
     fsml_full, fsmr_full, fsmb_full, fsmt_full = fsmLRBTC[:, 0, :, :, :, :], fsmLRBTC[:, 1, :, :, :, :], fsmLRBTC[:, 2, :, :, :, :], fsmLRBTC[:, 3, :, :, :, :]
     Ml, Mr, Mb, Mt = MLRBT[:, 0, :, :, :, :], MLRBT[:, 1, :, :, :, :], MLRBT[:, 2, :, :, :, :], MLRBT[:, 3, :, :, :, :]
     # block_sol.shape = [batch, 8*M, 8*M, I0, J0]
@@ -517,11 +532,8 @@ def funcD(inflow, I2A, fsmLRBTC, MLRBT, VecSize, M, I0, J0, device='cpu'):
                            torch.einsum('bklij,bloij,bomij->bkmij', Mr, fsmr_full, I2A),
                            torch.einsum('bklij,bloij,bomij->bkmij', Mb, fsmb_full, I2A),
                            torch.einsum('bklij,bloij,bomij->bkmij', Mt, fsmt_full, I2A)], dim=1)
-    # [1,2*M,1,1,1] and [batch,1,8*M,I0,J0]
-    mask_selected = torch.cat([torch.arange(2*M-1,-1,-1).reshape(1,2*M,1,1,1) < VecSize[:,0,:,:].unsqueeze(1).unsqueeze(2).repeat(1,1,8*M,1,1),
-                               torch.arange(2*M).reshape(1,2*M,1,1,1) < VecSize[:,1,:,:].unsqueeze(1).unsqueeze(2).repeat(1,1,8*M,1,1),
-                               torch.arange(2*M-1,-1,-1).reshape(1,2*M,1,1,1) < VecSize[:,2,:,:].unsqueeze(1).unsqueeze(2).repeat(1,1,8*M,1,1),
-                               torch.arange(2*M).reshape(1,2*M,1,1,1) < VecSize[:,3,:,:].unsqueeze(1).unsqueeze(2).repeat(1,1,8*M,1,1)], dim=1)
+    VecSize = VecSize.to(inflow.device)
+    mask_selected = block_basis_mask(VecSize, M, inflow.device)
     block = torch.zeros(inflow.shape[0], 8*M, 8*M, I0, J0, device=device)
     block[mask_selected] = block_sol[mask_selected]
     block[~mask_selected] = I2A[~mask_selected]
@@ -546,6 +558,7 @@ def funcDinv(inflow, I2A, fsmLRBTC, MLRBT, VecSize, M, I0, J0, device='cpu'):
     if len(I2A.shape) == 4 and len(fsmLRBTC.shape)==5 and len(MLRBT.shape)==5 and len(VecSize.shape)==3:
         I2A, fsmLRBTC, MLRBT, VecSize = I2A.unsqueeze(0), fsmLRBTC.unsqueeze(0), MLRBT.unsqueeze(0), VecSize.unsqueeze(0)
         mark = 1
+    device = inflow.device
     fsml_full, fsmr_full, fsmb_full, fsmt_full = fsmLRBTC[:, 0, :, :, :, :], fsmLRBTC[:, 1, :, :, :, :], fsmLRBTC[:, 2, :, :, :, :], fsmLRBTC[:, 3, :, :, :, :]
     Ml, Mr, Mb, Mt = MLRBT[:, 0, :, :, :, :], MLRBT[:, 1, :, :, :, :], MLRBT[:, 2, :, :, :, :], MLRBT[:, 3, :, :, :, :]
     # block_sol.shape = [batch, 8*M, 8*M, I0, J0]
@@ -553,11 +566,8 @@ def funcDinv(inflow, I2A, fsmLRBTC, MLRBT, VecSize, M, I0, J0, device='cpu'):
                            torch.einsum('bklij,bloij,bomij->bkmij', Mr, fsmr_full, I2A),
                            torch.einsum('bklij,bloij,bomij->bkmij', Mb, fsmb_full, I2A),
                            torch.einsum('bklij,bloij,bomij->bkmij', Mt, fsmt_full, I2A)], dim=1)
-    # [1,2*M,1,1,1] and [batch,1,8*M,I0,J0]
-    mask_selected = torch.cat([torch.arange(2*M-1,-1,-1).reshape(1,2*M,1,1,1).to(device) < VecSize[:,0,:,:].unsqueeze(1).unsqueeze(2).repeat(1,1,8*M,1,1),
-                               torch.arange(2*M).reshape(1,2*M,1,1,1).to(device) < VecSize[:,1,:,:].unsqueeze(1).unsqueeze(2).repeat(1,1,8*M,1,1),
-                               torch.arange(2*M-1,-1,-1).reshape(1,2*M,1,1,1).to(device) < VecSize[:,2,:,:].unsqueeze(1).unsqueeze(2).repeat(1,1,8*M,1,1),
-                               torch.arange(2*M).reshape(1,2*M,1,1,1).to(device) < VecSize[:,3,:,:].unsqueeze(1).unsqueeze(2).repeat(1,1,8*M,1,1)], dim=1)
+    VecSize = VecSize.to(inflow.device)
+    mask_selected = block_basis_mask(VecSize, M, inflow.device)
     block = torch.zeros(inflow.shape[0], 8*M, 8*M, I0, J0, device=device)
     block[mask_selected] = block_sol[mask_selected]
     block[~mask_selected] = I2A[~mask_selected]
@@ -624,7 +634,7 @@ def generate_TFPS_rhs_Dirichlet_iso(Q, psiL, psiR, psiB, psiT, Coef,  Kappa, ome
     if len(MLRBT.shape)==5:
         MLRBT = MLRBT.unsqueeze(0)
         mark = 1
-    Sigma_T, Sigma_a, Varepsilon = Coef[:, 0, :, :], Coef[:, 1, :, :], Coef[:, 2, :, :]
+    Sigma_T, Sigma_a, Varepsilon = Coef[:, 0, :, :], Coef[:, 1, :, :], torch.exp(Coef[:, 2, :, :])
     Ml, Mr, Mb, Mt = MLRBT[:, 0, :, :, :, :], MLRBT[:, 1, :, :, :, :], MLRBT[:, 2, :, :, :, :], MLRBT[:, 3, :, :, :, :]
     vec = special_sol_iso(Q, Sigma_T, Sigma_a, Varepsilon, Kappa, omega, M, I0, J0, device)
     rhs_in = torch.zeros(Q.shape[0], 8*M, I0, J0, device=device)
@@ -673,7 +683,7 @@ def generate_TFPS_rhs_Dirichlet_aniso(Q, psiL, psiR, psiB, psiT, Coef,  Kappa, o
     if len(MLRBT.shape)==5:
         MLRBT = MLRBT.unsqueeze(0)
         mark = 1
-    Sigma_T, Sigma_a, Varepsilon = Coef[:, 0, :, :], Coef[:, 1, :, :], Coef[:, 2, :, :]
+    Sigma_T, Sigma_a, Varepsilon = Coef[:, 0, :, :], Coef[:, 1, :, :], torch.exp(Coef[:, 2, :, :])
     Ml, Mr, Mb, Mt = MLRBT[:, 0, :, :, :, :], MLRBT[:, 1, :, :, :, :], MLRBT[:, 2, :, :, :, :], MLRBT[:, 3, :, :, :, :]
     vec = special_sol_aniso(Q, Sigma_T, Sigma_a, Varepsilon, Kappa, omega, M, I0, J0, device)
     rhs_in = torch.zeros(Q.shape[0], 8*M, I0, J0, device=device)
@@ -720,8 +730,7 @@ def correction(inflow, rhs_unselected, I2A, fsmLRBTC, MLRBT, VecSize, M, I0, J0,
         mark = 1
     result = func_inflow_Dirichlet_4correction(inflow, I2A, fsmLRBTC, MLRBT, VecSize, M, I0, J0, device)
     alpha_selected, sol_unselected = restrict_basis(result, VecSize, M, I0, J0, device)
-    # alpha_correction = rhs_unselected - sol_unselected
-    alpha_correction = rhs_unselected
+    alpha_correction = rhs_unselected - sol_unselected
     alpha_corrected = alpha_selected + alpha_correction
     fsml_full, fsmr_full, fsmb_full, fsmt_full, fsmc_full = fsmLRBTC[:, 0, :, :, :, :], fsmLRBTC[:, 1, :, :, :, :], fsmLRBTC[:, 2, :, :, :, :], fsmLRBTC[:, 3, :, :, :, :], fsmLRBTC[:, 4, :, :, :, :]
     # block.shape = [batch,8*M,8*M,I0,J0]
@@ -731,4 +740,3 @@ def correction(inflow, rhs_unselected, I2A, fsmLRBTC, MLRBT, VecSize, M, I0, J0,
     if mark == 1:
         alpha_corrected, inflow_corrected, valuec_corrected = alpha_corrected.squeeze(0), inflow_corrected.squeeze(0), valuec_corrected.squeeze(0)
     return alpha_corrected, inflow_corrected, valuec_corrected
-

@@ -2,14 +2,18 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import torch
 import scipy.io
-import sys
 import os
 import argparse
 import time
-import random
-import time
-from utils import greenprint
-from mgRTE.RTE_ATFPS_func import VDXY, FSM, Inflow2alpha, MLRO_Dirichlet, MBTO_Dirichlet
+
+try:
+    from .rte_config import dataset_filename, kernel_suffix, load_yaml_config, merge_cli_defaults, resolve_device, set_seed
+    from .utils import greenprint
+    from .RTE_ATFPS_func import VDXY, FSM, Inflow2alpha, MLRO_Dirichlet, MBTO_Dirichlet
+except ImportError:
+    from rte_config import dataset_filename, kernel_suffix, load_yaml_config, merge_cli_defaults, resolve_device, set_seed
+    from utils import greenprint
+    from RTE_ATFPS_func import VDXY, FSM, Inflow2alpha, MLRO_Dirichlet, MBTO_Dirichlet
 
 # 2d dense matrix
 def read_bm_data(fn):
@@ -42,8 +46,6 @@ def fun_value(I0, J0, xl, xr, yl, yr, coeff, device):
 
 class RTECoef(Dataset):
     def __init__(self, size, num_coef, data_type='transport', device = 'cpu', xl=0, xr=1, yl=0, yr=1):
-        # Sigma_T and Sigma_a
-        # torch.manual_seed(seed_num)
         self.num_coef = num_coef
         self.data_type = data_type
         self.size = size
@@ -82,12 +84,13 @@ class RTECoef(Dataset):
         return shuffled_Sigma_a, shuffled_Sigma_T
         
     
-    def get_epsilon(self, num):
-        if self.data_type == 'transport':
+    def get_epsilon(self, num, data_type=None):
+        data_type = data_type or self.data_type
+        if data_type == 'transport':
             Varepsilon = torch.ones([num,self.size,self.size]).to(self.device)
-        elif self.data_type == 'diffusion':
+        elif data_type == 'diffusion':
             Varepsilon = 0.01 * (torch.rand((num, 1, 1)).to(self.device) + 0.1) * torch.ones((1, self.size, self.size)).to(self.device)
-        elif self.data_type == 'interface':
+        elif data_type == 'interface':
             Varepsilon = torch.ones([num,self.size,self.size]).to(self.device)
             trial_diffusion = 0.01 * (torch.rand(num).to(self.device) + 0.1)
             sub_num = int(num / 6)
@@ -98,11 +101,13 @@ class RTECoef(Dataset):
             Varepsilon[4 * sub_num:5 * sub_num, int(self.size / 4):3 * int(self.size / 4), int(self.size / 4):3 * int(self.size / 4)] = trial_diffusion[4 * sub_num:5 * sub_num].reshape([-1,1,1]) * torch.ones((int(self.size / 2), int(self.size / 2))).to(self.device)
             Varepsilon[5 * sub_num:] = trial_diffusion[5 * sub_num:].reshape([-1,1,1]) * torch.ones((self.size, self.size)).to(self.device)
             Varepsilon[5 * sub_num:, int(self.size / 4):3 * int(self.size / 4), int(self.size / 4):3 * int(self.size / 4)] = torch.ones((int(self.size / 2), int(self.size / 2))).to(self.device)
-        elif self.data_type == 'bufferzone':
+        elif data_type == 'bufferzone':
             Varepsilon = torch.ones([num,self.size,self.size]).to(self.device)
             count = 0
             for n in range(2, 6):
                 sub_num = int(num / 4) if n < 4 else num - 3 * int(num / 4)
+                if sub_num == 0:
+                    continue
                 varepsilon_pre = torch.rand((sub_num, 2, n)).to(self.device)
                 varepsilon_pre[:, :, 0] = varepsilon_pre[:, :, 0] + 5
                 varepsilon_pre[:, :, 1:n + 1] = 10 * varepsilon_pre[:, :, 1:n + 1] - 5
@@ -121,15 +126,15 @@ class RTECoef(Dataset):
                 # 缩放到[0.001, 1]
                 Varepsilon[count:count + sub_num] = normalized * 0.999 + 0.001
                 count = count + sub_num
-        elif self.data_type == 'all':
+        elif data_type == 'all':
             Varepsilon = torch.ones([num,self.size,self.size]).to(self.device)
             sub_num = int(num / 4)
-            Varepsilon[:sub_num] = self.get_epsilon('transport', sub_num)
-            Varepsilon[sub_num:2 * sub_num] = self.get_epsilon('diffusion', sub_num)
-            Varepsilon[2 * sub_num:3 * sub_num] = self.get_epsilon('interface', sub_num)
-            Varepsilon[3 * sub_num:] = self.get_epsilon('bufferzone', num - 3 * sub_num)
+            Varepsilon[:sub_num] = self.get_epsilon(sub_num, 'transport')
+            Varepsilon[sub_num:2 * sub_num] = self.get_epsilon(sub_num, 'diffusion')
+            Varepsilon[2 * sub_num:3 * sub_num] = self.get_epsilon(sub_num, 'interface')
+            Varepsilon[3 * sub_num:] = self.get_epsilon(num - 3 * sub_num, 'bufferzone')
         else:
-            raise ValueError('data_type %s not supported' % self.data_type)
+            raise ValueError('data_type %s not supported' % data_type)
         return Varepsilon
     
     def getinfo(self, M, ct, st, omega, Kappa, tol):
@@ -161,22 +166,44 @@ class RTECoef(Dataset):
     
 if __name__ == "__main__":
     # python RTE_datagenerator.py --data_type diffusion --num_coef 1000 --cuda_device cuda:0 --tol_exp 5;
+    defaults = {
+        'cuda_device': 'cuda:0',
+        'data_type': 'diffusion',
+        'num_coef': 1000,
+        'mesh_size': 16,
+        'N': 1,
+        'tol_exp': 5,
+        'kernel_g': '0',
+        'seed': 1234,
+    }
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument('--config', type=str, default=None)
+    known, _ = bootstrap.parse_known_args()
+    defaults = merge_cli_defaults(defaults, load_yaml_config(known.config))
     parser = argparse.ArgumentParser(description="RTE datagenerator with configurable parameters.")
-    parser.add_argument('--cuda_device',     type = str,   nargs='?', default = 'cuda:0')
-    parser.add_argument('--data_type',       type = str,   nargs='?', default = 'bufferzone')
-    parser.add_argument('--num_coef',        type = int,   nargs='?', default = 2000)
-    parser.add_argument('--mesh_size',       type = int,   nargs='?', default = 16)
-    parser.add_argument('--N',               type = int,   nargs='?', default = 1)
-    parser.add_argument('--tol_exp',         type = float, nargs='?', default = 5)
+    parser.add_argument('--config',          type = str,   nargs='?', default = None)
+    parser.add_argument('--cuda_device',     type = str,   nargs='?', default = defaults['cuda_device'])
+    parser.add_argument('--data_type',       type = str,   nargs='?', default = defaults['data_type'])
+    parser.add_argument('--num_coef',        type = int,   nargs='?', default = defaults['num_coef'])
+    parser.add_argument('--mesh_size',       type = int,   nargs='?', default = defaults['mesh_size'])
+    parser.add_argument('--N',               type = int,   nargs='?', default = defaults['N'])
+    parser.add_argument('--tol_exp',         type = float, nargs='?', default = defaults['tol_exp'])
+    parser.add_argument('--kernel_g',        type = str,   nargs='?', default = defaults['kernel_g'])
+    parser.add_argument('--seed',            type = int,   nargs='?', default = defaults['seed'])
     args = parser.parse_args()
+    set_seed(args.seed)
     
     current_dir = os.path.dirname(__file__)
-    quadrature_path = current_dir + '/discretized_parameters/quadrature2DN'+str(args.N)+'.mat'
-    Kappa_path =  current_dir + '/discretized_parameters/KappaN'+str(args.N)+'g0.mat'
-    coef_path = current_dir + '/discretized_parameters/'+args.data_type+'N'+str(args.N)+'I'+str(args.mesh_size)+'d'+str(args.num_coef)+'tol'+str(args.tol_exp)+'.pt'
+    quadrature_path = os.path.join(current_dir, 'discretized_parameters', 'quadrature2DN'+str(args.N)+'.mat')
+    Kappa_path = os.path.join(current_dir, 'discretized_parameters', 'KappaN'+str(args.N)+kernel_suffix(args.kernel_g)+'.mat')
+    coef_path = os.path.join(
+        current_dir,
+        'discretized_parameters',
+        dataset_filename(args.data_type, args.N, args.mesh_size, args.num_coef, args.tol_exp),
+    )
     
-    device = torch.device(args.cuda_device if torch.cuda.is_available() else 'cpu')
-    greenprint(f"Using device: {args.cuda_device}")
+    device = resolve_device(args.cuda_device)
+    greenprint(f"Using device: {device}")
     tol = args.tol_exp*np.log(10)
     quadrature = scipy.io.loadmat(quadrature_path)
     ct = torch.tensor(quadrature['ct']).squeeze(-1).to(torch.float32).to(device)
