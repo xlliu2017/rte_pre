@@ -76,11 +76,12 @@ def run_name(args: Any, epoch: int) -> str:
         f"tol{number_token(args.tol_exp)}_multilevel"
     )
     loss_type = getattr(args, "loss_type", "raw")
-    if loss_type != "raw":
-        name = f"{name}_{loss_type}"
-        form = getattr(args, "preconditioner_form", "direct")
-        if form != "direct":
-            name = f"{name}_{form}"
+    rhs_mode = getattr(args, "rhs_mode", "fixed")
+    loss_normalization = getattr(args, "loss_normalization", "mse")
+    form = getattr(args, "preconditioner_form", "direct")
+    name = f"{name}_{loss_type}_{rhs_mode}_{loss_normalization}"
+    if form != "direct":
+        name = f"{name}_{form}"
     return name
 
 

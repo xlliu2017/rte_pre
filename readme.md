@@ -187,8 +187,13 @@ python RTE_datagenerator.py --data_type diffusion --num_coef 1000 --mesh_size 16
 python train.py --config configs/default.yaml
 ```
 
-The default config preserves the original raw-residual objective. The NPBS-style
-RTE objective trains in the block-Jacobi/Born coordinate `funcDinv(rhs)`:
+The default config preserves the original raw-residual objective, but now uses
+the NPBS-style training mechanics: fresh random residuals per batch and relative
+residual normalization. The older fixed-RHS/MSE behavior is still available with
+`--rhs_mode fixed --loss_normalization mse`.
+
+The NPBS-style RTE objective trains in the block-Jacobi/Born coordinate
+`funcDinv(rhs)`:
 
 ```bash
 python train.py --config configs/born_precond.yaml

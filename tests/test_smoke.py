@@ -47,6 +47,21 @@ def test_unsupervised_dataset_rhs_seed_is_reproducible():
     assert torch.equal(ds1.rhs, ds2.rhs)
 
 
+def test_unsupervised_dataset_can_skip_fixed_rhs_storage():
+    loaded = {
+        "Coef": torch.zeros(2, 3, 4, 4),
+        "fsmLRBTC": torch.zeros(2, 5, 4, 8, 4, 4),
+        "I2A": torch.zeros(2, 8, 8, 4, 4),
+        "MLRBT": torch.zeros(2, 4, 2, 4, 4, 4),
+        "VecSize": torch.zeros(2, 4, 4, 4, dtype=torch.int32),
+    }
+    ds = UnsuperviseDataset(1, 4, 2, 3, loaded, seed_num=7, store_rhs=False)
+    assert ds.rhs is None
+    *_, rhs = ds[0]
+    assert rhs.shape == (8, 4, 4)
+    assert torch.count_nonzero(rhs).item() == 0
+
+
 def test_all_regime_generates_valid_log_epsilon():
     data = RTECoef(2, 4, data_type="all", device="cpu")
     epsilon = torch.exp(data.coef[:, 2])

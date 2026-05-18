@@ -72,6 +72,8 @@ DEFAULTS = {
     "loss_type": "raw",
     "preconditioner_form": "direct",
     "physical_loss_weight": 0.1,
+    "rhs_mode": "random",
+    "loss_normalization": "relative",
 }
 
 
@@ -107,6 +109,8 @@ def build_parser(defaults):
     parser.add_argument("--loss_type", choices=["raw", "born", "born_mixed"], default=defaults["loss_type"])
     parser.add_argument("--preconditioner_form", choices=["direct", "residual"], default=defaults["preconditioner_form"])
     parser.add_argument("--physical_loss_weight", type=float, default=defaults["physical_loss_weight"])
+    parser.add_argument("--rhs_mode", choices=["random", "fixed"], default=defaults["rhs_mode"])
+    parser.add_argument("--loss_normalization", choices=["relative", "mse"], default=defaults["loss_normalization"])
     parser.add_argument("--no_save", action="store_true", help="Do not save loss curves or model weights.")
     return parser
 
@@ -163,7 +167,16 @@ def load_dataset(args, device):
 
 
 def make_loaders(args, data, device):
-    dataset = UnsuperviseDataset(args.N, args.mesh_size, args.num_coef, args.num_data, data, device="cpu", seed_num=args.seed)
+    dataset = UnsuperviseDataset(
+        args.N,
+        args.mesh_size,
+        args.num_coef,
+        args.num_data,
+        data,
+        device="cpu",
+        seed_num=args.seed,
+        store_rhs=args.rhs_mode == "fixed",
+    )
     train_len = int(0.8 * len(dataset))
     val_len = len(dataset) - train_len
     generator = torch.Generator().manual_seed(int(args.seed))
@@ -188,7 +201,7 @@ def move_batch(batch, device):
     return [tensor.to(device) for tensor in batch]
 
 
-def residual_loss(model, batch, M, args, device, loss_fn):
+def residual_loss(model, batch, M, args, device, loss_fn, return_metrics=False):
     return training_loss(
         model=model,
         batch=batch,
@@ -199,6 +212,9 @@ def residual_loss(model, batch, M, args, device, loss_fn):
         loss_type=args.loss_type,
         preconditioner_form=args.preconditioner_form,
         physical_loss_weight=args.physical_loss_weight,
+        rhs_mode=getattr(args, "rhs_mode", "fixed"),
+        loss_normalization=getattr(args, "loss_normalization", "mse"),
+        return_metrics=return_metrics,
     )
 
 
@@ -233,22 +249,30 @@ def main(argv=None):
         model.train()
         timer.reset()
         epoch_loss = 0.0
+        epoch_physical = 0.0
+        epoch_born = 0.0
         for batch in train_loader:
-            loss = residual_loss(model, batch, M, args, device, loss_fn)
+            loss, metrics = residual_loss(model, batch, M, args, device, loss_fn, return_metrics=True)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
+            epoch_physical += metrics["physical"].item()
+            epoch_born += metrics.get("born", metrics["physical"]).item()
         epoch_loss /= max(len(train_loader), 1)
+        epoch_physical /= max(len(train_loader), 1)
+        epoch_born /= max(len(train_loader), 1)
         scheduler.step()
         check_cuda_mem(device)
         train_losses.append(epoch_loss)
         logging.info(
-            "data_type=%s epoch=[%d/%d] train_loss=%.4e time=%.2fs lr=%.2e",
+            "data_type=%s epoch=[%d/%d] train_loss=%.4e train_physical=%.4e train_born=%.4e time=%.2fs lr=%.2e",
             args.data_type,
             epoch + 1,
             args.num_epochs,
             epoch_loss,
+            epoch_physical,
+            epoch_born,
             timer.elapsed("s"),
             scheduler.get_last_lr()[0],
         )
@@ -257,12 +281,27 @@ def main(argv=None):
             model.eval()
             timer.reset()
             val_loss = 0.0
+            val_physical = 0.0
+            val_born = 0.0
             with torch.no_grad():
                 for batch in val_loader:
-                    val_loss += residual_loss(model, batch, M, args, device, loss_fn).item()
+                    loss, metrics = residual_loss(model, batch, M, args, device, loss_fn, return_metrics=True)
+                    val_loss += loss.item()
+                    val_physical += metrics["physical"].item()
+                    val_born += metrics.get("born", metrics["physical"]).item()
             val_loss /= max(len(val_loader), 1)
+            val_physical /= max(len(val_loader), 1)
+            val_born /= max(len(val_loader), 1)
             val_losses.append(val_loss)
-            logging.info("epoch=[%d/%d] val_loss=%.4e time=%.2fs", epoch + 1, args.num_epochs, val_loss, timer.elapsed("s"))
+            logging.info(
+                "epoch=[%d/%d] val_loss=%.4e val_physical=%.4e val_born=%.4e time=%.2fs",
+                epoch + 1,
+                args.num_epochs,
+                val_loss,
+                val_physical,
+                val_born,
+                timer.elapsed("s"),
+            )
 
     if args.save:
         sub_dir = scheduler_subdir(args)

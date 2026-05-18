@@ -23,6 +23,8 @@ train:
   loss_type: raw
   preconditioner_form: direct
   physical_loss_weight: 0.1
+  rhs_mode: random
+  loss_normalization: relative
 
 scheduler:
   scheduler_name: CosineAnnealingLR

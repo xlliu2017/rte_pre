@@ -32,7 +32,7 @@ def fun_value(I0, J0, xl, xr, yl, yr, coeff):
     return value
 
 class UnsuperviseDataset(Dataset):
-    def __init__(self, N, size, num_coef, num_data, loaded_data, device='cpu', seed_num = 33):
+    def __init__(self, N, size, num_coef, num_data, loaded_data, device='cpu', seed_num = 33, store_rhs=True):
         # indices = torch.randperm(10000)[:num_coef]
         # self.Coef = loaded_data['Coef'][indices]
         # self.fsmLRBTC = loaded_data['fsmLRBTC'][indices]
@@ -45,9 +45,14 @@ class UnsuperviseDataset(Dataset):
         self.MLRBT = loaded_data['MLRBT']
         self.VecSize = loaded_data['VecSize']
         # M=N(N+1)/2
-        generator = torch.Generator(device='cpu')
-        generator.manual_seed(int(seed_num))
-        self.rhs = (2*torch.rand((num_data, 4*N*(N+1), size, size), generator=generator)-1).to(device)
+        self.rhs_shape = (4*N*(N+1), size, size)
+        self.store_rhs = store_rhs
+        if store_rhs:
+            generator = torch.Generator(device='cpu')
+            generator.manual_seed(int(seed_num))
+            self.rhs = (2*torch.rand((num_data, *self.rhs_shape), generator=generator)-1).to(device)
+        else:
+            self.rhs = None
         # self.rhs = torch.rand((num_data, 4*N*(N+1), size, size)).to(device)
         self.num_coef = num_coef
         self.num_data = num_data
@@ -56,7 +61,8 @@ class UnsuperviseDataset(Dataset):
     
     def __getitem__(self, idx):
         # idx should between 0 and self.num_coef*self.num_rhs-1
-        return self.Coef[idx % self.num_coef], self.fsmLRBTC[idx % self.num_coef], self.I2A[idx % self.num_coef], self.MLRBT[idx % self.num_coef], self.VecSize[idx % self.num_coef], self.rhs[idx]
+        rhs = self.rhs[idx] if self.rhs is not None else torch.zeros(self.rhs_shape)
+        return self.Coef[idx % self.num_coef], self.fsmLRBTC[idx % self.num_coef], self.I2A[idx % self.num_coef], self.MLRBT[idx % self.num_coef], self.VecSize[idx % self.num_coef], rhs
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RTE dataloader with configurable parameters.")
